@@ -1,0 +1,10 @@
+numpy
+scipy
+matplotlib
+pandas
+seaborn
+jupyterlab
+h5py
+networkx
+torch  # If using ML for pulse optimization
+
