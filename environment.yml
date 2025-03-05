@@ -1,0 +1,16 @@
+name: mis_env
+channels:
+  - conda-forge
+dependencies:
+  - python=3.9
+  - julia=1.8
+  - pip
+  - pip:
+    - jupyterlab
+    - numpy
+    - scipy
+    - matplotlib
+    - pandas
+    - seaborn
+  - conda-forge::openmpi
+  - conda-forge::mpi4py
