@@ -1,0 +1,26 @@
+{
+  "backend": "bloqade",
+  "controls": {
+    "T": 4.0e-06,
+    "N_t": 64,
+    "param_kind": "pwl",
+    "learn_omega": false,
+    "architecture": 2,
+    "omega_max": 15.8,
+    "delta_min": -25.0,
+    "delta_max": 25.0,
+    "n_delta_knots": 8,
+    "n_omega_modes": 5,
+    "n_delta_modes": 8,
+    "omega_scale": 1.0,
+    "omega_cap": null
+  },
+  "udg": {
+    "nx": 6,
+    "ny": 6,
+    "spacing": 1.0,
+    "radius": 2.5,
+    "dropout_rate": 0.4,
+    "seed": 122
+  }
+}

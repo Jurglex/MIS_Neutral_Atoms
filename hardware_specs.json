@@ -1,0 +1,9 @@
+{
+  "_units": "C6: rad/µs·µm⁶ | omega/delta: rad/µs | times: µs",
+  "C6": 5.42e6,
+  "omega_max": 15.8,
+  "delta_min": -125.0,
+  "delta_max": 125.0,
+  "t_ramp": 0.4,
+  "t_onset": 0.4
+}
