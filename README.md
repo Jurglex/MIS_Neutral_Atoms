@@ -27,7 +27,7 @@ Given an arbitrary graph, the pipeline produces time-dependent control schedules
 | -------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | **Graph generation** | `UDGConfig` (grid size, spacing, radius, dropout rate, seed)                                  | `nx.Graph` with node positions — a unit-disk graph on a defective square lattice                             |
 | **Module 1**         | `nx.Graph` (any graph; UDG or otherwise)                                                      | `GlobalSchedule`: time-discretized arrays Ω(t) and Δ(t) of length `N_t`, plus `dt` and parameterization kind |
-| **Module 2**         | `GlobalSchedule` + `nx.Graph` + `DeviceMetadata` (backend type, shot budget, lattice spacing) | `BackendResult`: estimated `p_MIS`, number of shots used, standard error                                     |
+| **Module 2**         | `GlobalSchedule` + `nx.Graph` + `positions` (atom coords in μm)                               | `BackendResult`: estimated `p_MIS`, number of shots used, standard error, raw bitstring counts               |
 | **Module 3**         | Batches of `(graph, p_MIS)` pairs from Module 2, plus the current `SchedulePolicy`            | Updated model weights; next graph to evaluate                                                                |
 
 
@@ -39,13 +39,13 @@ The primary model is `SchedulePolicy`: a 3-layer GIN encoder with concat(mean, m
 - **Architecture 1 (spline-knot):** Ω head uses 3 latent parameters (peak, width, center) reconstructed via a sin² envelope with boundary mask (Ω ≥ 0, Ω(0) = Ω(T) = 0). Δ head outputs 8 spline knots, linearly interpolated and tanh-clamped. Total action dim: 11 (or 8 with `learn_omega=false`).
 - **Architecture 2 (Fourier):** Ω head uses K sine coefficients (default 5); sigmoid applied to the summed series ensures Ω ∈ [0, ω_max]. Δ head uses a DC offset + K cosine coefficients (default 8), tanh-clamped. Total action dim: 14 (or 9 with `learn_omega=false`).
 
-A Gaussian policy over the latent parameter space supports REINFORCE/PPO training. Two simpler baselines (`GNNModel`, `AdjacencyMLP`) are also available.
+A Gaussian policy over the latent parameter space supports REINFORCE/PPO training.  `SchedulePolicy` also inherits from `ScheduleModel`, making it interchangeable with simpler baselines (`FixedScheduleBaseline`, `GNNModel`, `AdjacencyMLP`) in evaluation code.
 
-**Module 2 (interface only)** — Quantum backends.
-Abstract `QuantumBackend` class defining the `estimate_p_mis` contract. Two backends are planned: a Bloqade simulator and QuEra Aquila hardware. Not implemented yet.
+**Module 2 (implemented)** — Quantum backends.
+`BraketBackend` implements the `QuantumBackend` interface using Amazon Braket's AHS simulator and QuEra Aquila QPU.  It converts a `GlobalSchedule` (Ω/Δ in rad/μs) to Braket `TimeSeries` (rad/s), builds an `AtomArrangement` from atom positions (μm → m), validates against Aquila hardware limits, and post-processes measurement counts into a `BackendResult` with p_MIS and standard error.
 
-**Module 3 (interface only + REINFORCE scaffold)** — Learning and orchestration.
-Abstract `Learner` and `Orchestrator` classes defining the training loop contract. A scaffold `reinforce_step` function is provided but requires a working backend to run.
+**Module 3 (implemented)** — Learning and orchestration.
+`ReinforceLearner` implements the full REINFORCE training loop with per-graph EMA baseline, optional value-function critic, and gradient clipping.  `TrainingOrchestrator` drives the loop with periodic evaluation against the `FixedScheduleBaseline` (graph-agnostic adiabatic sweep), checkpointing, and graph pool refresh.  A CLI entry point (`train.py`) supports Braket local simulator or mock backends.
 
 ## Repository structure
 
@@ -60,27 +60,37 @@ MIS_Neutral_Atoms/
 │   └── unit_disk.py           # generate_square_lattice_udg() → (nx.Graph, positions)
 │
 ├── module1/                   # Graph→Schedule models
-│   ├── base.py                # ScheduleModel ABC
-│   ├── featurize.py           # graph_to_pyg(), Laplacian PE, algebraic connectivity
+│   ├── base.py                # ScheduleModel ABC + FixedScheduleBaseline
+│   ├── featurize.py           # graph_to_pyg(), Laplacian PE, triangles, algebraic connectivity
 │   ├── encoder.py             # GINEncoder (3-layer GIN + concat pooling)
 │   ├── heads.py               # OmegaHead, AnalyticOmega, DeltaHead, FourierOmegaHead, FourierDeltaHead
 │   ├── policy.py              # SchedulePolicy (full model: encoder + heads + value)
 │   ├── gnn.py                 # GNNModel (simple baseline)
 │   └── adjacency_mlp.py       # AdjacencyMLP (simple baseline)
 │
-├── module2/                   # Quantum backend interfaces
-│   └── interfaces.py          # QuantumBackend ABC, DeviceMetadata, BackendResult
+├── module2/                   # Quantum backends
+│   ├── interfaces.py          # QuantumBackend ABC, DeviceMetadata, BackendResult, Positions
+│   ├── braket_backend.py      # BraketBackend: LocalSimulator + Aquila QPU via Braket AHS
+│   ├── graph_MIS_utils.py     # MIS post-processing (check IS, find p_MIS from counts)
+│   └── schedule_pmis_module.py # Low-level Braket AHS driver (reference implementation)
 │
 ├── module3/                   # Learning / orchestration
 │   ├── interfaces.py          # Learner ABC, Orchestrator ABC, TrainingConfig
-│   └── reinforce.py           # REINFORCE training step scaffold
+│   ├── reinforce.py           # REINFORCE training step (EMA baseline + value critic)
+│   ├── learner.py             # ReinforceLearner (train, evaluate, checkpoint)
+│   ├── orchestrator.py        # TrainingOrchestrator (main loop, logging, eval)
+│   └── backend_adapter.py     # Wraps QuantumBackend → reward function
+│
+├── train.py                   # CLI entry point: python train.py [--steps N --shots K]
 │
 ├── visualization/
 │   └── graphsample.py         # Sample and plot UDGs from config
 │
 ├── tests/
-│   ├── test_config_and_udg.py # Config loading and UDG generation tests
-│   └── test_module1_model.py  # Module 1 model / policy tests (25 tests)
+│   ├── test_config_and_udg.py      # Config loading and UDG generation tests
+│   ├── test_module1_model.py       # Module 1 model / policy tests (26 tests)
+│   ├── test_integration_m1_m2.py   # End-to-end Graph → Module 1 → Module 2 tests
+│   └── test_module3_training.py    # Module 3 training loop tests (9 tests)
 │
 └── requirements.txt
 ```
@@ -92,8 +102,8 @@ The encoder is shared; the decoder heads depend on the `architecture` config val
 ```
 networkx.Graph
     │
-    ├─ featurize.py: degree, clustering, Laplacian PE (k=4), λ₂
-    │
+    ├─ featurize.py: degree, clustering, triangles, Laplacian PE (k=4)
+    │                 graph-level: n/64, m/256, λ₂, density
     ▼
 PyG Data object
     │
@@ -104,7 +114,7 @@ GINEncoder (3 layers, hidden=64)
 concat(mean, max, sum) pooling → 192-d
     │
     ▼
-concat with scalar graph features → 195-d
+concat with scalar graph features → 196-d
     │
     ├──────────────────┬────────────────────────────┐
     ▼                  ▼                            ▼
@@ -118,7 +128,7 @@ reconstruct Ω(t)   reconstruct Δ(t)
 Ω(t) ∈ ℝ^N_t      Δ(t) ∈ ℝ^N_t
     └──────┬───────────┘
            ▼
-     GlobalScheduleomega_cap
+     GlobalSchedule
 ```
 
 ### Architecture comparison
@@ -135,6 +145,54 @@ reconstruct Ω(t)   reconstruct Δ(t)
 | **Expressiveness**   | Local control via spline knots                                          | Global control via Fourier modes; inherently smooth                                   |
 | **Best for**         | Sharp, localized schedule features                                      | Smooth, globally structured schedules                                                 |
 
+
+## Module 2 — Quantum backend
+
+`BraketBackend` is the concrete `QuantumBackend` that bridges Module 1 output to Amazon Braket.
+
+```
+GlobalSchedule (rad/μs)         Positions (μm)
+        │                           │
+        ▼                           ▼
+  ┌─ BraketBackend ─────────────────────────┐
+  │  1. Unit conversion: rad/μs → rad/s     │
+  │     positions: μm → m                   │
+  │  2. Build Braket TimeSeries + register   │
+  │  3. Validate against Aquila HW limits    │
+  │  4. Run LocalSimulator or Aquila QPU     │
+  │  5. Post-process: bitstring counts       │
+  │     → find IS of target cardinality      │
+  │     → p_MIS + binomial std error         │
+  └──────────────────────────────────────────┘
+        │
+        ▼
+  BackendResult
+    .p_mis     (float)
+    .shots     (int)
+    .std_err   (float)
+    .counts    (dict[str, int])
+```
+
+### Usage
+
+```python
+from config import load_project_config_json
+from graphs.unit_disk import generate_square_lattice_udg
+from module1.policy import SchedulePolicy
+from module2.braket_backend import BraketBackend
+
+cfg = load_project_config_json()
+G, pos = generate_square_lattice_udg(cfg.udg)
+
+policy = SchedulePolicy(cfg)
+schedule = policy.make_schedule(G)
+
+backend = BraketBackend(cfg, n_shots=100, backend_type="simulator")
+result = backend.estimate_p_mis(schedule, G, pos)
+print(f"p_MIS = {result.p_mis:.2%} ± {result.std_err:.2%}")
+```
+
+`amazon-braket-sdk` is an optional dependency — the rest of the codebase works without it.
 
 ## Key data types
 
@@ -254,14 +312,62 @@ Loaded alongside `config.json`.  If the file is missing, built-in Aquila default
 
 When `learn_omega` is `false`, the analytic Ω peak is computed from the blockade condition: `Ω_peak = min(C₆ / R_b⁶, omega_max)` where `R_b = udg.radius × udg.spacing` (μm).  The envelope is trapezoidal: ramp up over `t_ramp`, hold at `Ω_peak`, ramp down over `t_ramp`.
 
+## Module 3 — Training loop
+
+`ReinforceLearner` implements a REINFORCE policy-gradient loop that trains `SchedulePolicy` to maximize p_MIS from quantum backend evaluations.
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  TrainingOrchestrator.run()                                         │
+│                                                                     │
+│  for step in 1..total_steps:                                        │
+│      graphs = learner.select_batch(train_pool)                      │
+│      metrics = learner.train_step(graphs)                           │
+│      ┌─────────────────────────────────────────┐                    │
+│      │ reinforce_step():                        │                    │
+│      │   1. Batch featurize (graph_to_pyg)      │                    │
+│      │   2. sample_schedule(batch) → Ω, Δ, logp │                    │
+│      │   3. For each graph: backend_fn → reward  │                    │
+│      │   4. EMA baseline → advantage             │                    │
+│      │   5. Policy loss = -logp × advantage      │                    │
+│      │   6. Value loss = MSE(V, reward)          │                    │
+│      │   7. optimizer.step() + grad clip         │                    │
+│      └─────────────────────────────────────────┘                    │
+│      if step % eval_every == 0:                                     │
+│          evaluate(eval_pool) vs FixedScheduleBaseline               │
+│          checkpoint best model                                      │
+│      if step % pool_refresh == 0:                                   │
+│          regenerate graph pool with new seeds                        │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### Training quickstart
+
+```bash
+# Mock backend (no Braket SDK needed — random rewards for testing the loop)
+python train.py --backend mock --steps 100 --batch-size 4
+
+# Braket local simulator (requires amazon-braket-sdk)
+python train.py --steps 2000 --shots 50 --batch-size 8
+
+# See all options
+python train.py --help
+```
+
 ## Setup
 
 ```bash
 # Create environment and install dependencies
 pip install -r requirements.txt
 
-# Run tests (29 tests covering config, hardware specs, UDG, featurization, heads, and full policy)
+# Run all tests (38 total across 4 test files)
 python -m pytest tests/ -v
+
+# Quick Module 1 + 3 unit tests (no Braket needed)
+python -m pytest tests/test_module1_model.py tests/test_module3_training.py -v
+
+# Integration tests (requires amazon-braket-sdk)
+python tests/test_integration_m1_m2.py
 ```
 
 All code assumes the repository root is the working directory (imports use `from config import ...`, `from module1 import ...`, etc.).

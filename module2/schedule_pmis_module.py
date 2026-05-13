@@ -1,21 +1,23 @@
-# schedule-pmis-module.py
-""" 
-This module takes as input a schedule (numpy array) and atom arrangement (list of positions)
-and outputs the measurement report.
-a probability p of measuring an MIS if this schedule is applied. 
-"""
-import numpy as np
-import json
-import os
+"""Low-level Braket AHS driver.
 
+Takes a piecewise schedule (duration/value arrays) and atom positions,
+builds an ``AnalogHamiltonianSimulation``, runs it on the Braket local
+simulator or QuEra Aquila, and post-processes the measurement report.
+
+.. note::
+   Prefer the higher-level :class:`~module2.braket_backend.BraketBackend`
+   for integration with the rest of the pipeline.  This module is kept as
+   the original reference implementation.
+"""
+from __future__ import annotations
+
+import math
+import os
+import pickle
 import time
 from datetime import datetime
 
 import numpy as np
-import math
-import pickle
-
-from ahs_utils import plot_avg_density_2D, show_global_drive, show_register, show_final_avg_density
 
 from braket.ahs.analog_hamiltonian_simulation import AnalogHamiltonianSimulation
 from braket.ahs.atom_arrangement import AtomArrangement
@@ -24,7 +26,11 @@ from braket.timings.time_series import TimeSeries
 from braket.devices import LocalSimulator
 from braket.aws import AwsDevice
 
-from graph_MIS_utils import *
+from module2.graph_MIS_utils import (
+    check_independent_set,
+    find_MIS_probability,
+    regroup_by_ones_counts,
+)
 
 # arXiv:2306.11727 Sec. 1.5, p. 16 — Program / geometry limits (Braket-implementable programs)
 AQUILA_PROGRAM_GEOMETRY_LIMITS = {

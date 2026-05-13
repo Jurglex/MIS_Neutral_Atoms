@@ -19,7 +19,7 @@ A living document tracking architectural decisions, rationale, alternatives cons
 
 ### 2.1 Encoder: GIN + structural node features + concat pooling
 
-**Decision:** 3-layer GIN, hidden 64, node features = [degree, clustering, top-k Laplacian eigenvector entries], pooled with concat(mean, max, sum), augmented with scalar graph features (n, m, λ₂).
+**Decision:** 3-layer GIN, hidden 64, node features = [degree, clustering, triangle_count, top-k Laplacian eigenvector entries], pooled with concat(mean, max, sum), augmented with scalar graph features (n, m, λ₂, density).
 
 **Rationale:**
 
@@ -121,8 +121,8 @@ For typical Aquila-scale lattices, C₆/R_b⁶ greatly exceeds the hardware max 
 ```
 networkx.Graph
     │
-    ├─ feature precomputation (degree, clustering, Laplacian PE, λ₂)
-    │
+    ├─ feature precomputation (degree, clustering, triangles, Laplacian PE)
+    │   graph-level: n/64, m/256, λ₂, density
     ▼
 PyG Data object
     │
@@ -133,7 +133,7 @@ GIN encoder (3 layers, hidden=64)
 concat(mean, max, sum) pooling → 192-d
     │
     ▼
-concat with scalar graph features → ~195-d
+concat with scalar graph features → 196-d
     │
     ├──────────────┬──────────────┐
     ▼              ▼              ▼
@@ -187,8 +187,8 @@ Selected via `config.controls.architecture = 2`. Shares the same GIN encoder, fe
 
 ## 4. Implementation milestones
 
-1. ~~**Day 1:** Skeleton modules (encoder, heads, schedule reconstruction). Unit-test with random graphs that shapes are correct and gradients flow.~~ **Done.** Split into `featurize.py`, `encoder.py`, `heads.py`, `policy.py`. 25 tests passing (both architectures).
-2. **Day 2:** Wire to Bloqade. Single-graph overfit: can we drive p_MIS up on a fixed n=20 graph with REINFORCE?
+1. ~~**Day 1:** Skeleton modules (encoder, heads, schedule reconstruction). Unit-test with random graphs that shapes are correct and gradients flow.~~ **Done.** Split into `featurize.py`, `encoder.py`, `heads.py`, `policy.py`. 29 tests passing (both architectures).
+2. ~~**Day 2:** Wire to Bloqade.~~ **Done.** `BraketBackend` converts `GlobalSchedule` → Braket AHS, runs `LocalSimulator("braket_ahs")`, returns `BackendResult`. End-to-end integration verified. Single-graph overfit: can we drive p_MIS up on a fixed n=20 graph with REINFORCE?
 3. **Day 3:** Multi-graph training, n=20. Confirm encoder is doing useful work (vs. constant-input baseline).
 4. **Day 4:** PPO + value head. Curriculum to n=30, n=40.
 5. **Day 5:** Validation on held-out graphs and on Aquila (limited shots).
@@ -234,3 +234,27 @@ Selected via `config.controls.architecture = 2`. Shares the same GIN encoder, fe
   - `SchedulePolicy` computes Ω_peak and ramp fractions from `HardwareSpecs` + `UDGConfig` when `learn_omega=False`.
   - `UDGConfig.spacing` units clarified as μm (needed for C₆ calculation).
   - 29 tests total (added blockade omega, trapezoidal shape, and onset tests).
+- **v4 (Module 2 integration):**
+  - `BraketBackend(QuantumBackend)` implemented in `module2/braket_backend.py`. Converts `GlobalSchedule` (rad/μs, seconds) → Braket `TimeSeries` (rad/s, seconds), builds `AtomArrangement` from positions (μm → m), validates against Aquila hardware limits.
+  - `QuantumBackend.estimate_p_mis` signature updated: now requires `positions: Positions` (atom coordinates in μm) alongside schedule and graph.
+  - `BackendResult` extended with `counts` field (raw bitstring dict) and `binomial_std_err()` helper.
+  - Third-party code cleaned up: renamed `graph_MIS_utils (1).py` → `graph_MIS_utils.py`, removed broken `ahs_utils` import from `schedule_pmis_module.py`, fixed `check_independent_set` bug (`'1'` → `'r'` for Braket AHS alphabet), fixed `KeyError` in `regroup_by_ones_dict` when no shots match target cardinality.
+  - Bug fix in `graphs/unit_disk.py`: `generate_square_lattice_udg` used `radius / spacing` for neighbor offsets, but `radius` is already in units of `spacing`. Produced zero-edge graphs when `spacing ≠ 1.0`.
+  - `amazon-braket-sdk` added to `requirements.txt` as optional dependency; Braket imports are lazy.
+  - 5 integration tests (`test_integration_m1_m2.py`) verify Graph → Module 1 → Module 2 → BackendResult end-to-end for both architectures.
+- **v5 (Module 3 + literature-informed refinements):**
+  - **Literature review:** analyzed Pichler 2018, Ebadi 2022 (Science), Cain 2023, Lukin 2024 (SQS), Schuetz 2024 (compilation toolkit), Hegde 2023 (LSTM schedules), Sohrabizadeh 2024 (GNN p_MIS prediction), and others.
+  - **Featurization expanded:**
+    - Node features: added per-node triangle count (normalized). Motivated by Schuetz et al. — triangles/cliques correlate with blockade frustration and problem hardness.
+    - Graph features: added graph density as 4th scalar. `GRAPH_FEAT_DIM` 3 → 4; node feat dim 2+k → 3+k.
+  - **`FixedScheduleBaseline` added** to `module1/base.py`: trapezoidal Ω + linear Δ sweep (Ebadi-style adiabatic protocol). Graph-agnostic — returns the same schedule regardless of input. Serves as the comparison target: any learned policy must outperform this to demonstrate graph-conditioned value.
+  - **`SchedulePolicy` now inherits from both `nn.Module` and `ScheduleModel`**, making it interchangeable with baselines in evaluation code.
+  - **Module 3 implemented:**
+    - `TrainingConfig` expanded with batch_size, eval_graphs, entropy/value-loss coefficients, grad_clip, n_shots, pool settings, checkpoint/log dirs.
+    - `reinforce_step` enhanced: added critic value-function loss (MSE), gradient norm tracking, min/max reward logging.
+    - `ReinforceLearner(Learner)`: manages policy, optimizer, EMA baseline, graph pool, evaluation against `FixedScheduleBaseline`, checkpointing.
+    - `TrainingOrchestrator(Orchestrator)`: main training loop with periodic evaluation, best-model checkpointing, graph pool refresh, JSON history logging.
+    - `backend_adapter.py`: bridges `QuantumBackend.estimate_p_mis` to the `(Graph, Schedule) → float` reward function signature. Positions read from `G.graph["positions"]`.
+    - `train.py` CLI: `--backend mock` for testing without Braket, `--backend simulator` for real p_MIS. Supports `--steps`, `--shots`, `--batch-size`, `--lr`, etc.
+  - 9 new tests in `test_module3_training.py`: pool construction, baseline validation, learner instantiation, single train step, evaluation, checkpoint round-trip, standalone reinforce_step, ScheduleModel isinstance check.
+  - 38 total tests across the project (3 config + 26 Module 1 + 9 Module 3), all passing.

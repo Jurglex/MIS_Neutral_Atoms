@@ -17,6 +17,7 @@ from torch_geometric.data import Batch
 
 from config import ProjectConfig, compute_blockade_omega
 from schedules import GlobalSchedule
+from module1.base import ScheduleModel
 from module1.featurize import graph_to_pyg, K_PE_DEFAULT
 from module1.encoder import GINEncoder
 from module1.heads import (
@@ -27,11 +28,15 @@ from module1.heads import (
     OmegaHead,
 )
 
-GRAPH_FEAT_DIM = 3  # (n_nodes_norm, n_edges_norm, lambda_2)
+GRAPH_FEAT_DIM = 4  # (n_nodes_norm, n_edges_norm, lambda_2, density)
 
 
-class SchedulePolicy(nn.Module):
+class SchedulePolicy(nn.Module, ScheduleModel):
     """GIN → reduced-basis policy network for Rydberg MIS schedules.
+
+    Inherits from both ``nn.Module`` (for PyTorch training) and
+    ``ScheduleModel`` (so evaluation code can treat it interchangeably
+    with simpler baselines like ``FixedScheduleBaseline``).
 
     Parameters
     ----------
@@ -55,10 +60,10 @@ class SchedulePolicy(nn.Module):
         k_pe: int = K_PE_DEFAULT,
         init_log_std: float = -1.0,
     ):
-        super().__init__()
+        nn.Module.__init__(self)
         self.config = config
         self.k_pe = k_pe
-        node_feat_dim = 2 + k_pe  # degree + clustering + PE
+        node_feat_dim = 3 + k_pe  # degree + clustering + triangles + PE
 
         self.encoder = GINEncoder(node_feat_dim, hidden_dim, n_gnn_layers)
         embed_dim = self.encoder.out_dim + GRAPH_FEAT_DIM

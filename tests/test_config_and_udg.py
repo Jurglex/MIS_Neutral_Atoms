@@ -29,13 +29,13 @@ def test_generate_square_lattice_udg_deterministic_and_positions():
     if G1.number_of_nodes() > 0:
         assert set(G1.nodes()) == set(range(G1.number_of_nodes()))
 
-    # Edge lengths are within radius (with tiny tolerance)
-    r = cfg.radius
+    # Edge lengths are within radius (physical distance = radius * spacing)
+    r_phys = cfg.radius * cfg.spacing
     for u, v in G1.edges():
         x1, y1 = pos1[u]
         x2, y2 = pos1[v]
         d2 = (x1 - x2) ** 2 + (y1 - y2) ** 2
-        assert d2 <= r * r + 1e-9
+        assert d2 <= r_phys * r_phys + 1e-9
 
 
 def test_dropout_fixed_count_across_seeds():

@@ -18,7 +18,7 @@
   "udg": {
     "nx": 6,
     "ny": 6,
-    "spacing": 1.0,
+    "spacing": 4.0,
     "radius": 2.5,
     "dropout_rate": 0.4,
     "seed": 122

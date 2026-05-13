@@ -40,11 +40,12 @@ def algebraic_connectivity(G: nx.Graph) -> float:
 def graph_to_pyg(G: nx.Graph, k_pe: int = K_PE_DEFAULT) -> Data:
     """Convert a networkx graph to a PyG ``Data`` object with structural features.
 
-    Node features  (dim = 2 + k_pe):
-        [degree_normalized, clustering_coeff, laplacian_pe_0 … laplacian_pe_{k-1}]
+    Node features  (dim = 3 + k_pe):
+        [degree_norm, clustering_coeff, triangle_count_norm,
+         laplacian_pe_0 … laplacian_pe_{k-1}]
 
-    Graph-level features  (dim = 3, stored as ``data.graph_feats``):
-        [n_nodes / 64, n_edges / 256, lambda_2]
+    Graph-level features  (dim = GRAPH_FEAT_DIM, stored as ``data.graph_feats``):
+        [n_nodes / 64, n_edges / 256, lambda_2, density]
     """
     n = G.number_of_nodes()
     nodes = sorted(G.nodes())
@@ -52,9 +53,16 @@ def graph_to_pyg(G: nx.Graph, k_pe: int = K_PE_DEFAULT) -> Data:
 
     deg = np.array([G.degree(v) for v in nodes], dtype=np.float32) / max(n - 1, 1)
     clust = np.array([nx.clustering(G, v) for v in nodes], dtype=np.float32)
+
+    triangles = nx.triangles(G)
+    max_tri = max(max(triangles.values(), default=0), 1)
+    tri = np.array([triangles[v] / max_tri for v in nodes], dtype=np.float32)
+
     pe = laplacian_positional_encoding(G, k=k_pe)
 
-    x = np.concatenate([deg[:, None], clust[:, None], pe], axis=1).astype(np.float32)
+    x = np.concatenate(
+        [deg[:, None], clust[:, None], tri[:, None], pe], axis=1
+    ).astype(np.float32)
 
     edges = []
     for u, v in G.edges():
@@ -66,11 +74,13 @@ def graph_to_pyg(G: nx.Graph, k_pe: int = K_PE_DEFAULT) -> Data:
         else torch.zeros((2, 0), dtype=torch.long)
     )
 
+    density = nx.density(G)
     graph_feats = torch.tensor(
-        [n / MAX_NODES_NORM, G.number_of_edges() / MAX_EDGES_NORM, algebraic_connectivity(G)],
+        [n / MAX_NODES_NORM, G.number_of_edges() / MAX_EDGES_NORM,
+         algebraic_connectivity(G), density],
         dtype=torch.float32,
     )
 
     data = Data(x=torch.from_numpy(x), edge_index=edge_index)
-    data.graph_feats = graph_feats.unsqueeze(0)  # (1, 3) for batching
+    data.graph_feats = graph_feats.unsqueeze(0)
     return data

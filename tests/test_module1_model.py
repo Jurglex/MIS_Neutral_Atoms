@@ -95,10 +95,10 @@ def test_baselines_schedule_shapes():
 def test_graph_to_pyg_shapes():
     g = nx.path_graph(10)
     data = graph_to_pyg(g, k_pe=4)
-    assert data.x.shape == (10, 6)  # 2 + 4 PE dims
+    assert data.x.shape == (10, 7)  # 3 + 4 PE dims (degree, clustering, triangles + PE)
     assert data.edge_index.shape[0] == 2
     assert data.edge_index.shape[1] == 2 * g.number_of_edges()
-    assert data.graph_feats.shape == (1, 3)
+    assert data.graph_feats.shape == (1, 4)
 
 
 def test_laplacian_pe_padding_small_graph():

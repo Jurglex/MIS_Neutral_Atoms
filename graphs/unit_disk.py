@@ -49,12 +49,12 @@ def generate_square_lattice_udg(cfg: UDGConfig) -> tuple[nx.Graph, dict[int, tup
     G_raw = nx.Graph()
 
     # Efficient edge construction using integer grid offsets within the radius
-    r = float(cfg.radius)
+    r = float(cfg.radius)  # already in units of spacing
     s = float(cfg.spacing)
     kept_set = set(kept_coords)
 
-    max_cells = int(math.ceil(r / s))
-    r_over_s = r / s
+    max_cells = int(math.ceil(r))
+    r_grid = r  # radius in grid units (= cfg.radius, since it's in units of spacing)
 
     @lru_cache(maxsize=128)
     def _neighbor_offsets(max_cells_arg: int, r_over_s_arg: float) -> tuple[tuple[int, int], ...]:
@@ -71,7 +71,7 @@ def generate_square_lattice_udg(cfg: UDGConfig) -> tuple[nx.Graph, dict[int, tup
                     offsets_local.append((dx, dy))
         return tuple(offsets_local)
 
-    offsets = _neighbor_offsets(max_cells, r_over_s)
+    offsets = _neighbor_offsets(max_cells, r_grid)
 
     # Build edges list and add in bulk
     edges: list[tuple[tuple[int, int], tuple[int, int]]] = []
