@@ -10,13 +10,15 @@ import networkx as nx
 import pytest
 import torch
 
-from config import load_project_config_json
+from config import load_project_config_json, RewardConfig
 from schedules import GlobalSchedule
 from module1.policy import SchedulePolicy
 from module1.base import FixedScheduleBaseline
+from module2.interfaces import BackendResult
 from module3.interfaces import TrainingConfig
 from module3.learner import ReinforceLearner, _build_graph_pool
 from module3.reinforce import reinforce_step
+from module3.backend_adapter import _is_cost_from_counts, _raw_reward as _compute_reward
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +220,103 @@ def test_policy_is_schedule_model():
     cfg = _project_config()
     policy = SchedulePolicy(cfg)
     assert isinstance(policy, ScheduleModel)
+
+
+# ---------------------------------------------------------------------------
+# Reward functions
+# ---------------------------------------------------------------------------
+
+def _triangle_graph():
+    """3-node triangle: MIS size = 1, any pair violates."""
+    G = nx.cycle_graph(3)
+    return G
+
+
+def test_is_cost_no_violations():
+    """Single selected node, no edge violations → cost = 1 / n_nodes."""
+    G = _triangle_graph()
+    counts = {"rgg": 5, "grg": 3, "ggr": 2}
+    cost = _is_cost_from_counts(counts, G, penalty_U=3.0, normalize_by_nodes=True)
+    assert cost == pytest.approx(1.0 / 3.0)
+
+
+def test_is_cost_with_violations():
+    """Two adjacent selected → cost = (2 - U) per violating shot."""
+    G = _triangle_graph()
+    counts = {"rrg": 10}
+    cost = _is_cost_from_counts(counts, G, penalty_U=3.0, normalize_by_nodes=False)
+    assert cost == pytest.approx(2.0 - 3.0)
+
+
+def test_is_cost_all_ground():
+    """All ground state → cost = 0."""
+    G = _triangle_graph()
+    counts = {"ggg": 100}
+    cost = _is_cost_from_counts(counts, G, penalty_U=3.0, normalize_by_nodes=False)
+    assert cost == 0.0
+
+
+def test_is_cost_mixed_shots():
+    """Mix of valid and violating shots."""
+    G = nx.path_graph(3)  # edges: 0-1, 1-2
+    counts = {
+        "rgr": 6,  # nodes 0,2 selected, no edge between them → cost = 2
+        "rrg": 4,  # nodes 0,1 selected, edge 0-1 violated → cost = 2 - U
+    }
+    U = 3.0
+    expected = (6 * 2.0 + 4 * (2.0 - U)) / 10.0 / 3.0  # normalized by 3 nodes
+    cost = _is_cost_from_counts(counts, G, penalty_U=U, normalize_by_nodes=True)
+    assert cost == pytest.approx(expected)
+
+
+def test_compute_reward_p_mis():
+    """p_mis reward kind returns result.p_mis directly."""
+    result = BackendResult(p_mis=0.42, shots=100, counts={"rgr": 42, "ggg": 58})
+    G = nx.path_graph(3)
+    cfg = RewardConfig(kind="p_mis")
+    assert _compute_reward(result, G, cfg) == pytest.approx(0.42)
+
+
+def test_compute_reward_is_cost():
+    """is_cost reward kind computes from counts."""
+    G = nx.path_graph(3)  # edges: 0-1, 1-2
+    counts = {"rgr": 10}  # IS of size 2, no violations
+    result = BackendResult(p_mis=0.5, shots=10, counts=counts)
+    cfg = RewardConfig(kind="is_cost", penalty_U=3.0, normalize_by_nodes=True)
+    reward = _compute_reward(result, G, cfg)
+    assert reward == pytest.approx(2.0 / 3.0)
+
+
+def test_compute_reward_composite():
+    """composite blends is_cost and p_mis."""
+    G = nx.path_graph(3)
+    counts = {"rgr": 10}
+    result = BackendResult(p_mis=0.5, shots=10, counts=counts)
+    cfg = RewardConfig(kind="composite", penalty_U=3.0, mis_bonus=0.3,
+                       normalize_by_nodes=True)
+    r_cost = 2.0 / 3.0
+    r_mis = 0.5
+    expected = 0.7 * r_cost + 0.3 * r_mis
+    reward = _compute_reward(result, G, cfg)
+    assert reward == pytest.approx(expected)
+
+
+def test_compute_reward_unknown_kind_raises():
+    result = BackendResult(p_mis=0.1, shots=10)
+    G = nx.path_graph(3)
+    cfg = RewardConfig(kind="invalid")
+    with pytest.raises(ValueError, match="Unknown reward kind"):
+        _compute_reward(result, G, cfg)
+
+
+def test_reward_config_defaults():
+    """RewardConfig defaults are is_cost_vs_baseline, U=3, normalized."""
+    cfg = RewardConfig()
+    assert cfg.kind == "is_cost_vs_baseline"
+    assert cfg.penalty_U == 3.0
+    assert cfg.normalize_by_nodes is True
+    assert cfg.mis_bonus == 0.0
+    assert cfg.baseline_norm_eps > 0.0
 
 
 # ---------------------------------------------------------------------------

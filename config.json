@@ -5,13 +5,17 @@
     "N_t": 64,
     "param_kind": "pwl",
     "learn_omega": false,
-    "architecture": 2,
+    "architecture": 3,
     "omega_max": 15.8,
     "delta_min": -25.0,
     "delta_max": 25.0,
     "n_delta_knots": 8,
     "n_omega_modes": 5,
     "n_delta_modes": 8,
+    "warm_start": true,
+    "residual_alpha_start": 0.05,
+    "residual_alpha_end": 1.0,
+    "residual_alpha_warmup_steps": 200,
     "omega_scale": 1.0,
     "omega_cap": null
   },
@@ -22,5 +26,12 @@
     "radius": 2.5,
     "dropout_rate": 0.4,
     "seed": 122
+  },
+  "reward": {
+    "kind": "is_cost_vs_baseline",
+    "penalty_U": 3.0,
+    "mis_bonus": 0.0,
+    "normalize_by_nodes": true,
+    "baseline_norm_eps": 1e-3
   }
 }

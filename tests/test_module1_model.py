@@ -28,13 +28,14 @@ def _make_config(
     N_t: int = 16,
     learn_omega: bool = False,
     architecture: int = 1,
+    warm_start: bool = False,
 ) -> ProjectConfig:
     controls = ControlsConfig(
         T=4e-6, N_t=N_t, param_kind=ParamKind.pwc,
         learn_omega=learn_omega, architecture=architecture,
         omega_max=15.8, delta_min=-25.0, delta_max=25.0,
         n_delta_knots=8, n_omega_modes=5, n_delta_modes=8,
-        omega_scale=2.0, omega_cap=None,
+        warm_start=warm_start, omega_scale=2.0, omega_cap=None,
     )
     udg = UDGConfig(nx=4, ny=4, spacing=1.0, radius=2.0, dropout_rate=0.0, seed=0)
     hardware = HardwareSpecs(C6=5.42e6, omega_max=15.8, t_ramp=0.3, t_onset=0.0)
@@ -342,3 +343,112 @@ def test_policy_delta_bounds(arch):
     delta = out["delta"]
     assert (delta >= cfg.controls.delta_min - 1e-3).all()
     assert (delta <= cfg.controls.delta_max + 1e-3).all()
+
+
+# ---------------------------------------------------------------------------
+# Warm-start / residual parameterization tests
+# ---------------------------------------------------------------------------
+
+from module1.base import FixedScheduleBaseline
+
+
+@pytest.mark.parametrize("arch", [1, 2])
+def test_warm_start_omega_near_baseline_at_init(arch):
+    """With warm_start, learned omega at init should closely match the baseline."""
+    torch.manual_seed(0)
+    cfg = _make_config(N_t=64, learn_omega=True, architecture=arch, warm_start=True)
+    policy = SchedulePolicy(cfg)
+    baseline = FixedScheduleBaseline(cfg)
+
+    g = nx.path_graph(10)
+    sched_learned = policy.make_schedule(g)
+    sched_baseline = baseline.make_schedule(g)
+
+    np.testing.assert_allclose(
+        sched_learned.omega, sched_baseline.omega, atol=3.0,
+        err_msg=f"Arch {arch}: warm-start omega deviates too far from baseline at init",
+    )
+
+
+@pytest.mark.parametrize("arch", [1, 2])
+def test_warm_start_delta_closer_to_baseline_than_without(arch):
+    """With warm_start, delta at init should be closer to the baseline than without."""
+    torch.manual_seed(0)
+    cfg_ws = _make_config(N_t=64, learn_omega=False, architecture=arch, warm_start=True)
+    cfg_no = _make_config(N_t=64, learn_omega=False, architecture=arch, warm_start=False)
+    policy_ws = SchedulePolicy(cfg_ws)
+    # Use the same weights for a fair comparison
+    policy_no = SchedulePolicy(cfg_no)
+    policy_no.load_state_dict(policy_ws.state_dict(), strict=False)
+
+    baseline = FixedScheduleBaseline(cfg_ws)
+
+    g = nx.path_graph(10)
+    delta_ws = policy_ws.make_schedule(g).delta
+    delta_no = policy_no.make_schedule(g).delta
+    delta_bl = baseline.make_schedule(g).delta
+
+    err_ws = np.abs(delta_ws - delta_bl).mean()
+    err_no = np.abs(delta_no - delta_bl).mean()
+    assert err_ws < err_no, (
+        f"Arch {arch}: warm-start delta (mean err={err_ws:.2f}) should be "
+        f"closer to baseline than without (mean err={err_no:.2f})"
+    )
+
+
+@pytest.mark.parametrize("arch", [1, 2])
+def test_warm_start_gradient_flow(arch):
+    """Gradients still flow through the residual correction path."""
+    torch.manual_seed(0)
+    cfg = _make_config(N_t=32, learn_omega=True, architecture=arch, warm_start=True)
+    policy = SchedulePolicy(cfg)
+    graphs = _test_graphs()
+    batch = Batch.from_data_list([graph_to_pyg(g) for g in graphs])
+    out = policy.sample_schedule(batch)
+
+    loss = out["omega"].sum() + out["delta"].sum()
+    loss.backward()
+
+    params_with_grad = {
+        name for name, p in policy.named_parameters()
+        if p.grad is not None and p.grad.abs().sum() > 0
+    }
+    assert any("encoder" in n for n in params_with_grad)
+    assert any("omega_head" in n for n in params_with_grad)
+    assert any("delta_head" in n for n in params_with_grad)
+
+
+def test_warm_start_omega_unaffected_when_not_learned():
+    """When learn_omega=False, warm_start should not alter the analytic omega."""
+    torch.manual_seed(0)
+    cfg_ws = _make_config(N_t=64, learn_omega=False, architecture=1, warm_start=True)
+    cfg_no = _make_config(N_t=64, learn_omega=False, architecture=1, warm_start=False)
+    policy_ws = SchedulePolicy(cfg_ws)
+    policy_no = SchedulePolicy(cfg_no)
+
+    g = nx.path_graph(10)
+    omega_ws = policy_ws.make_schedule(g).omega
+    omega_no = policy_no.make_schedule(g).omega
+    np.testing.assert_allclose(omega_ws, omega_no, atol=1e-5,
+                               err_msg="Warm-start should not change analytic omega")
+
+
+def test_warm_start_physical_bounds_respected():
+    """Warm-start outputs stay within physical bounds even with large corrections."""
+    torch.manual_seed(42)
+    cfg = _make_config(N_t=32, learn_omega=True, architecture=1, warm_start=True)
+    policy = SchedulePolicy(cfg)
+
+    # Force large network outputs by scaling weights
+    with torch.no_grad():
+        for p in policy.omega_head.parameters():
+            p.mul_(10.0)
+        for p in policy.delta_head.parameters():
+            p.mul_(10.0)
+
+    g = nx.path_graph(10)
+    sched = policy.make_schedule(g)
+    assert (sched.omega >= -1e-6).all(), "Omega went negative"
+    assert (sched.omega <= cfg.controls.omega_max + 1e-3).all()
+    assert (sched.delta >= cfg.controls.delta_min - 1e-3).all()
+    assert (sched.delta <= cfg.controls.delta_max + 1e-3).all()

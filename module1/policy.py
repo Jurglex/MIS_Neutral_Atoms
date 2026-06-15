@@ -25,6 +25,8 @@ from module1.heads import (
     DeltaHead,
     FourierDeltaHead,
     FourierOmegaHead,
+    MonotoneDeltaHead,
+    MultiplicativeOmegaHead,
     OmegaHead,
 )
 
@@ -70,17 +72,21 @@ class SchedulePolicy(nn.Module, ScheduleModel):
 
         controls = config.controls
         arch = controls.architecture
+        hw = config.hardware
+        R_b_um = config.udg.radius * config.udg.spacing
 
         if controls.learn_omega:
             if arch == 1:
                 self.omega_head: nn.Module = OmegaHead(embed_dim, controls)
             elif arch == 2:
                 self.omega_head = FourierOmegaHead(embed_dim, controls)
+            elif arch == 3:
+                self.omega_head = MultiplicativeOmegaHead(
+                    embed_dim, controls, hw, R_b_um,
+                )
             else:
                 raise ValueError(f"Unknown architecture {arch}")
         else:
-            hw = config.hardware
-            R_b_um = config.udg.radius * config.udg.spacing
             omega_peak = compute_blockade_omega(hw.C6, R_b_um, hw.omega_max)
             T_us = controls.T * 1e6
             self.omega_head = AnalyticOmega(
@@ -95,6 +101,8 @@ class SchedulePolicy(nn.Module, ScheduleModel):
             self.delta_head: nn.Module = DeltaHead(embed_dim, controls)
         elif arch == 2:
             self.delta_head = FourierDeltaHead(embed_dim, controls)
+        elif arch == 3:
+            self.delta_head = MonotoneDeltaHead(embed_dim, controls)
         else:
             raise ValueError(f"Unknown architecture {arch}")
 
@@ -105,6 +113,135 @@ class SchedulePolicy(nn.Module, ScheduleModel):
         n_action_params = self.omega_head.n_params + self.delta_head.n_params
         self.log_std = nn.Parameter(torch.full((n_action_params,), init_log_std))
 
+        # ── warm-start / residual parameterization ──────────────────
+        # Architecture 3 has the residual structure baked into its heads —
+        # warm_start is ignored to avoid double-counting.
+        self._warm_start = controls.warm_start and arch != 3
+        if self._warm_start:
+            self._init_warm_start_buffers(config)
+
+        # ── residual α schedule (trust-region-style budget) ─────────
+        # alpha=0 ⇒ exactly baseline, alpha=1 ⇒ unmodified head output.
+        # Applied to both Arch 1/2 warm-start corrections AND to the
+        # parameter magnitudes for Arch 3 (so initial exploration is small).
+        self.register_buffer(
+            "residual_alpha",
+            torch.tensor(float(controls.residual_alpha_start)),
+        )
+
+    def _init_warm_start_buffers(self, config: ProjectConfig) -> None:
+        """Precompute the baseline schedule and neutral head profiles.
+
+        When warm_start is enabled, head outputs are interpreted as
+        *corrections* relative to the fixed adiabatic baseline:
+
+            final(t) = baseline(t) + [head(t) − neutral(t)]
+
+        At random initialization the head outputs ≈ neutral, so the
+        corrections start near zero and the model produces ≈ baseline.
+        """
+        ctrl = config.controls
+        hw = config.hardware
+        N_t = ctrl.N_t
+
+        # Baseline omega: trapezoidal envelope (same as FixedScheduleBaseline)
+        R_b_um = config.udg.radius * config.udg.spacing
+        omega_peak = compute_blockade_omega(hw.C6, R_b_um, hw.omega_max)
+        T_us = ctrl.T * 1e6
+        t = torch.linspace(0.0, 1.0, N_t)
+        r = max(hw.t_ramp / T_us, 1e-9)
+        o = hw.t_onset / T_us
+        rise = ((t - o) / r).clamp(0.0, 1.0)
+        fall = ((1.0 - o - t) / r).clamp(0.0, 1.0)
+        baseline_omega = omega_peak * torch.min(rise, fall)
+
+        # Baseline delta: linear sweep from delta_min to delta_max
+        baseline_delta = torch.linspace(
+            ctrl.delta_min, ctrl.delta_max, N_t
+        )
+
+        self.register_buffer("_baseline_omega", baseline_omega)
+        self.register_buffer("_baseline_delta", baseline_delta)
+
+        # Neutral profiles: what the heads output for zero-valued params.
+        # At random init the MLP outputs are small (~0), so head_output ≈
+        # reconstruct(zeros).  Subtracting this makes the correction ≈ 0.
+        with torch.no_grad():
+            if self.omega_head.n_params > 0:
+                z_omega = torch.zeros(1, self.omega_head.n_params)
+                self.register_buffer(
+                    "_neutral_omega",
+                    self.omega_head.reconstruct(z_omega).squeeze(0),
+                )
+            else:
+                self.register_buffer("_neutral_omega", torch.zeros(N_t))
+
+            z_delta = torch.zeros(1, self.delta_head.n_params)
+            self.register_buffer(
+                "_neutral_delta",
+                self.delta_head.reconstruct(z_delta).squeeze(0),
+            )
+
+    def _apply_warm_start(
+        self, omega: torch.Tensor, delta: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert head outputs from absolute values to baseline + α·correction.
+
+        Parameters
+        ----------
+        omega, delta : (B, N_t) tensors from the head reconstructions.
+
+        Returns
+        -------
+        Corrected (omega, delta) tensors, clamped to physical bounds.
+
+        Notes
+        -----
+        The correction is scaled by ``self.residual_alpha``:
+
+            final(t) = baseline(t) + α · [head(t) − neutral(t)]
+
+        With ``α`` small early in training the policy is constrained to a
+        narrow neighborhood of the baseline, then the neighborhood expands
+        as ``α`` is annealed by the orchestrator.
+        """
+        ctrl = self.config.controls
+        alpha = self.residual_alpha
+
+        if self.omega_head.n_params > 0:
+            omega_corr = omega - self._neutral_omega.unsqueeze(0)
+            omega = (
+                self._baseline_omega.unsqueeze(0) + alpha * omega_corr
+            ).clamp(0.0, ctrl.omega_max)
+
+        delta_corr = delta - self._neutral_delta.unsqueeze(0)
+        delta = (
+            self._baseline_delta.unsqueeze(0) + alpha * delta_corr
+        ).clamp(ctrl.delta_min, ctrl.delta_max)
+        return omega, delta
+
+    def set_residual_alpha(self, alpha: float) -> None:
+        """Update the residual scaling factor.  Called by the orchestrator
+        once per training step from the configured warmup schedule."""
+        self.residual_alpha.fill_(float(alpha))
+
+    def current_alpha(self, step: int) -> float:
+        """Compute the warmup-scheduled α for the given training step.
+
+        Linear interpolation from ``residual_alpha_start`` →
+        ``residual_alpha_end`` over ``residual_alpha_warmup_steps``.
+        """
+        ctrl = self.config.controls
+        warmup = max(ctrl.residual_alpha_warmup_steps, 0)
+        if warmup <= 0:
+            return float(ctrl.residual_alpha_end)
+        frac = min(max(step / float(warmup), 0.0), 1.0)
+        return (
+            float(ctrl.residual_alpha_start)
+            + frac
+            * (float(ctrl.residual_alpha_end) - float(ctrl.residual_alpha_start))
+        )
+
     # ------------------------------------------------------------------
     # Core forward pass
     # ------------------------------------------------------------------
@@ -114,11 +251,37 @@ class SchedulePolicy(nn.Module, ScheduleModel):
         h = self.encoder(batch.x, batch.edge_index, batch.batch)
         return torch.cat([h, batch.graph_feats], dim=-1)
 
+    def _arch3_alpha_scale(self) -> torch.Tensor:
+        """Scaling factor on Arch 3 head parameters before reconstruction.
+
+        Architecture 3 heads are constructed so that ``params = 0`` already
+        produces the analytic baseline (zero-initialized linear layers +
+        baseline-equivalent reconstruction).  Scaling the params by α
+        shrinks the deviation from baseline by the same factor, giving the
+        same trust-region behavior the warm-start path provides for
+        Arch 1/2.
+        """
+        return self.residual_alpha
+
     def forward(self, batch: Batch) -> dict[str, torch.Tensor]:
         """Deterministic forward: mean schedule parameters + value estimate."""
         embed = self.encode(batch)
-        omega_params, omega = self.omega_head(embed)
-        delta_params, delta = self.delta_head(embed)
+        omega_params, omega_full = self.omega_head(embed)
+        delta_params, _delta_full = self.delta_head(embed)
+
+        arch = self.config.controls.architecture
+        if arch == 3:
+            alpha = self._arch3_alpha_scale()
+            if self.omega_head.n_params > 0:
+                omega = self.omega_head.reconstruct(alpha * omega_params)
+            else:
+                omega = omega_full
+            delta = self.delta_head.reconstruct(alpha * delta_params)
+        else:
+            omega, delta = omega_full, _delta_full
+            if self._warm_start:
+                omega, delta = self._apply_warm_start(omega, delta)
+
         value = self.value_head(embed).squeeze(-1)
         mean_params = torch.cat([omega_params, delta_params], dim=-1)
         return {
@@ -153,11 +316,23 @@ class SchedulePolicy(nn.Module, ScheduleModel):
 
         n_omega = self.omega_head.n_params
         omega_p, delta_p = sampled[:, :n_omega], sampled[:, n_omega:]
-        if n_omega > 0:
-            omega = self.omega_head.reconstruct(omega_p)
+
+        arch = self.config.controls.architecture
+        if arch == 3:
+            alpha = self._arch3_alpha_scale()
+            if n_omega > 0:
+                omega = self.omega_head.reconstruct(alpha * omega_p)
+            else:
+                _, omega = self.omega_head(out["embed"])
+            delta = self.delta_head.reconstruct(alpha * delta_p)
         else:
-            _, omega = self.omega_head(out["embed"])
-        delta = self.delta_head.reconstruct(delta_p)
+            if n_omega > 0:
+                omega = self.omega_head.reconstruct(omega_p)
+            else:
+                _, omega = self.omega_head(out["embed"])
+            delta = self.delta_head.reconstruct(delta_p)
+            if self._warm_start:
+                omega, delta = self._apply_warm_start(omega, delta)
 
         return {
             "omega": omega,
@@ -167,6 +342,19 @@ class SchedulePolicy(nn.Module, ScheduleModel):
             "value": out["value"],
             "entropy": dist.entropy().sum(dim=-1),
         }
+
+    def log_prob_for(
+        self, batch: Batch, sampled_params: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute log-prob, entropy, and value for previously-sampled params.
+
+        Used by PPO to re-evaluate stored rollouts under the current policy.
+        """
+        out = self.forward(batch)
+        dist = self.action_dist(out["mean_params"])
+        logprob = dist.log_prob(sampled_params).sum(dim=-1)
+        entropy = dist.entropy().sum(dim=-1)
+        return logprob, entropy, out["value"]
 
     # ------------------------------------------------------------------
     # ScheduleModel-compatible inference interface

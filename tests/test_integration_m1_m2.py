@@ -143,8 +143,9 @@ def test_full_pipeline_end_to_end():
     print(f"       Counts: {result.counts}")
 
 
-# ── Test 5: Both architectures work through the pipeline ────────────────
+# ── Test 5: Architectures 1, 2, and 3 work through the pipeline ──────────
 
+@pytest.mark.parametrize("arch", [1, 2, 3])
 def test_pipeline_both_architectures(arch):
     from module2.braket_backend import BraketBackend
 

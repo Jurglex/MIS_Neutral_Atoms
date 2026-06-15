@@ -52,7 +52,28 @@ class ControlsConfig:
     n_omega_modes : int
         Number of sine modes for Ω(t) in Arch 2.
     n_delta_modes : int
-        Number of cosine modes for Δ(t) in Arch 2.
+        Number of cosine modes for Δ(t) in Arch 2 / monotone increments in Arch 3.
+    warm_start : bool
+        If True (default), the policy outputs are interpreted as
+        *corrections* to the fixed adiabatic baseline schedule
+        (trapezoidal Ω + linear Δ sweep).  At random initialization
+        the corrections are near zero, so the model starts producing
+        the baseline schedule and learns graph-specific perturbations.
+
+        For ``architecture == 3`` this flag is implicit (the heads carry
+        the residual structure themselves) and is ignored.
+    residual_alpha_start : float
+        Initial scale on the residual correction in the warm-start /
+        residual parameterization.  ``alpha=0`` means "exactly baseline",
+        ``alpha=1`` means "head output replaces baseline".  Recommended
+        small (~0.05) so early exploration only nudges the baseline.
+    residual_alpha_end : float
+        Final scale after the warmup window.  Set ``== residual_alpha_start``
+        to disable the schedule.
+    residual_alpha_warmup_steps : int
+        Number of training steps over which ``alpha`` linearly anneals
+        from ``residual_alpha_start`` to ``residual_alpha_end``.
+        Set to 0 to disable annealing.
     omega_scale : float
         Scale factor for the simple baseline Ω derivation (omega_scale / radius^6).
         Used only by the non-learned baseline models (GNNModel, AdjacencyMLP).
@@ -72,6 +93,10 @@ class ControlsConfig:
     n_delta_knots: int = 8
     n_omega_modes: int = 5
     n_delta_modes: int = 8
+    warm_start: bool = True
+    residual_alpha_start: float = 0.05
+    residual_alpha_end: float = 1.0
+    residual_alpha_warmup_steps: int = 200
     omega_scale: float = 1.0
     omega_cap: float | None = None
 
@@ -144,6 +169,61 @@ class HardwareSpecs:
     t_onset: float = 0.0
 
 
+@dataclass(frozen=True)
+class RewardConfig:
+    """Reward function configuration for Module 3 training.
+
+    Parameters
+    ----------
+    kind : str
+        Which reward function to use:
+
+        ``"is_cost"`` — Weighted independent-set cost.
+            r = (1/N_shots) Σ [Σ_i s_i  −  U · Σ_{(i,j)∈E} s_i·s_j]
+            Dense gradient signal from every bitstring; does not require
+            knowing |MIS|.
+
+        ``"is_cost_vs_baseline"`` (default) — Per-graph normalized
+        improvement of ``is_cost`` over the analytic adiabatic baseline.
+            r_norm = (r_learned − r_baseline) / (|r_baseline| + ε)
+            Removes per-graph reward heterogeneity (different graphs have
+            different achievable cost), so the gradient signal becomes
+            "fractional improvement over adiabatic baseline".  Strongly
+            recommended for stable training.  Requires a baseline-reward
+            cache (handled by the learner).
+
+        ``"p_mis"`` — Binary MIS hit rate (legacy).
+            r = fraction of shots that are both independent sets and have
+            cardinality equal to the (approximate) maximum IS size.
+            Extremely sparse for non-trivial graphs.
+
+        ``"composite"`` — Weighted combination of is_cost and p_mis.
+            r = (1 − λ) · r_cost  +  λ · r_mis.
+            Anneal λ from 0→1 during training for dense→precise signal.
+
+    penalty_U : float
+        Edge-violation penalty weight for cost-based rewards.
+        Must be > 1 for unweighted MIS.  Typical range: 1.5–5.0.
+    mis_bonus : float
+        Weight λ on the MIS-hit term in ``composite`` mode.  Ignored by
+        the other reward kinds.
+    normalize_by_nodes : bool
+        If True, divide the IS cost by the number of nodes in the graph
+        so that rewards are comparable across graph sizes (independently
+        of the ``vs_baseline`` normalization).
+    baseline_norm_eps : float
+        Numerical epsilon ε added to the denominator in
+        ``is_cost_vs_baseline``.  Prevents division-by-zero on graphs
+        whose baseline cost is exactly zero.
+    """
+
+    kind: str = "is_cost_vs_baseline"
+    penalty_U: float = 3.0
+    mis_bonus: float = 0.0
+    normalize_by_nodes: bool = True
+    baseline_norm_eps: float = 1e-3
+
+
 def compute_blockade_omega(
     C6: float, R_b_um: float, omega_max_hw: float,
 ) -> float:
@@ -165,6 +245,7 @@ class ProjectConfig:
     controls: ControlsConfig
     udg: UDGConfig
     hardware: HardwareSpecs
+    reward: RewardConfig = RewardConfig()
 
 
 def derive_omega_schedule(controls: ControlsConfig, udg: UDGConfig) -> NDArray[np.float64]:
@@ -216,6 +297,17 @@ def _controls_from_dict(d: dict) -> ControlsConfig:
         n_delta_knots=int(d.get("n_delta_knots", ControlsConfig.n_delta_knots)),
         n_omega_modes=int(d.get("n_omega_modes", ControlsConfig.n_omega_modes)),
         n_delta_modes=int(d.get("n_delta_modes", ControlsConfig.n_delta_modes)),
+        warm_start=bool(d.get("warm_start", ControlsConfig.warm_start)),
+        residual_alpha_start=float(d.get(
+            "residual_alpha_start", ControlsConfig.residual_alpha_start
+        )),
+        residual_alpha_end=float(d.get(
+            "residual_alpha_end", ControlsConfig.residual_alpha_end
+        )),
+        residual_alpha_warmup_steps=int(d.get(
+            "residual_alpha_warmup_steps",
+            ControlsConfig.residual_alpha_warmup_steps,
+        )),
         omega_scale=float(d.get("omega_scale", ControlsConfig.omega_scale)),
         omega_cap=d.get("omega_cap", ControlsConfig.omega_cap),
     )
@@ -229,6 +321,20 @@ def _udg_from_dict(d: dict) -> UDGConfig:
         radius=float(d.get("radius", UDGConfig.radius)),
         dropout_rate=float(d.get("dropout_rate", UDGConfig.dropout_rate)),
         seed=int(d.get("seed", UDGConfig.seed)),
+    )
+
+
+def _reward_from_dict(d: dict) -> RewardConfig:
+    return RewardConfig(
+        kind=str(d.get("kind", RewardConfig.kind)),
+        penalty_U=float(d.get("penalty_U", RewardConfig.penalty_U)),
+        mis_bonus=float(d.get("mis_bonus", RewardConfig.mis_bonus)),
+        normalize_by_nodes=bool(d.get(
+            "normalize_by_nodes", RewardConfig.normalize_by_nodes
+        )),
+        baseline_norm_eps=float(d.get(
+            "baseline_norm_eps", RewardConfig.baseline_norm_eps
+        )),
     )
 
 
@@ -250,7 +356,11 @@ def project_config_from_dict(
     controls = _controls_from_dict(d.get("controls", {}))
     udg = _udg_from_dict(d.get("udg", {}))
     hardware = _hardware_from_dict(hardware_dict or {})
-    return ProjectConfig(backend=backend, controls=controls, udg=udg, hardware=hardware)
+    reward = _reward_from_dict(d.get("reward", {}))
+    return ProjectConfig(
+        backend=backend, controls=controls, udg=udg,
+        hardware=hardware, reward=reward,
+    )
 
 
 def load_project_config_json(

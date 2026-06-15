@@ -85,7 +85,54 @@ A living document tracking architectural decisions, rationale, alternatives cons
 - **Algorithm:** PPO with shared encoder + value head. Start with REINFORCE + baseline if PPO is overkill for early experiments.
 - **Warm start:** initialize so that the mean policy reproduces a linear Ebadi-style ramp. Skips ~thousands of shots of "discover monotone Δ helps."
 - **Curriculum:** train on n=20 → 30 → 40 → 60. GNN encoder should transfer; total time T scales with √n approximately.
-- **Reward shaping:** `r = approx_ratio + α · p_MIS` to get gradient signal on hard instances where p_MIS is sparse.
+- **Reward shaping:** see §2.7 for the configurable reward function design.
+
+### 2.7 Configurable reward function
+
+**Decision:** The reward function is selectable via `RewardConfig.kind` in `config.json`. Three options:
+
+1. **`"is_cost"`** (default) — Weighted independent-set cost from raw measurement bitstrings:
+   `r = (1/N_shots) Σ_shots [Σ_i s_i − U · Σ_{(i,j)∈E} s_i·s_j]`, optionally normalized by `|V|`.
+   Dense gradient signal; no NP-hard oracle needed. Directly aligned with the Rydberg Hamiltonian ground-state objective.
+
+2. **`"p_mis"`** (legacy) — Fraction of shots that are independent sets of maximum cardinality. Extremely sparse for non-trivial graphs; requires an (approximate) |MIS| computation.
+
+3. **`"composite"`** — `r = (1−λ)·r_cost + λ·r_mis`, where λ = `mis_bonus`. Enables curriculum: start with λ≈0 (dense cost signal), anneal to λ→1 (precise MIS targeting).
+
+**Rationale (literature-informed):**
+
+- Pure p_MIS is a near-zero signal on most graphs — the policy gets no gradient telling it which direction is better.  A schedule producing many IS of size |MIS|−1 gets the same reward (zero) as one producing only ground states.
+- The IS cost is the quantum Hamiltonian cost function itself (Pichler et al. 2018): in the Δ→+∞ limit, the Rydberg Hamiltonian ground state is the MIS.  Rewarding the RL agent with this cost means it optimizes the same objective the physics is optimizing.
+- The penalty U > 1 ensures that adding a conflicting node is always worse than not adding it (for unweighted MIS).  U = 3 works well empirically; too large → heavy penalty dominates and discourages excitation.
+- Normalization by |V| keeps rewards comparable across different graph sizes, important for mixed-size training pools.
+- Ebadi et al. (2022), Kim et al. (2024) report "approximation ratio" as their figure of merit, which is closely related to the IS cost.
+- Byun et al. (2024) use a composite reward that transitions from cost-based to MIS-hit-based during training.
+
+### 2.8 Warm-start / residual parameterization
+
+**Decision:** When `warm_start=True` (default), the decoder heads' outputs are interpreted as *corrections* relative to the fixed adiabatic baseline schedule (trapezoidal Ω + linear Δ sweep):
+
+```
+final(t) = baseline(t) + [head(t) − neutral(t)]
+```
+
+where `neutral(t)` is what the head would produce for a zero-valued parameter vector (computed once at initialization and stored as a buffer).
+
+At random initialization the MLP outputs are small (Xavier init), so `head(t) ≈ neutral(t)`, corrections ≈ 0, and the model starts producing the baseline schedule.  Training then learns graph-specific perturbations that improve on the baseline.
+
+**Rationale:**
+
+- **The research question becomes sharper:** "Can a GNN learn graph-specific *corrections* to the standard adiabatic protocol?" rather than "Can it rediscover adiabatic physics from scratch?"
+- **No wasted training on known physics:** Without warm-start, the model must first discover that Ω should be ~15.8 rad/μs and Δ should sweep negative→positive. This takes thousands of training steps of expensive quantum simulation to learn something we already know.
+- **Better optimization landscape:** The model starts in a high-reward region (the baseline is already a reasonable protocol). Gradients from the first training step are already informative.
+- **Precedent:** Cain et al. (2023) and Hegde et al. (2023) both use variations of this approach — starting from a known-good protocol and learning perturbations.
+
+**Implementation details:**
+
+- When `learn_omega=False`, warm-start only applies to Delta (Omega is already the baseline via AnalyticOmega).
+- The neutral profile is computed via `head.reconstruct(zeros)` — this works for all head types (spline, Fourier) without architecture-specific code.
+- The correction magnitude is naturally bounded by the heads' sigmoid/tanh clamping, preventing extreme deviations.
+- Final outputs are additionally clamped to physical bounds [0, ω_max] and [Δ_min, Δ_max].
 
 ### 2.5 `learn_omega` toggle and analytic Ω envelope
 
@@ -183,6 +230,87 @@ Selected via `config.controls.architecture = 2`. Shares the same GIN encoder, fe
 - When the hard zero boundary condition on Ω is not critical (e.g. hardware already ramps to zero externally).
 - As a comparison baseline to measure how much the spline inductive bias helps.
 
+### 2.9 Architecture 3 — physics-prior heads (v8)
+
+**Decision:** New decoder family that bakes the adiabatic baseline directly
+into the head architecture, rather than relying on warm-start residuals
+around a generic learned head.
+
+- `MultiplicativeOmegaHead`: Ω(t) = Ω_baseline(t) · (1 + γ · tanh(Σ_k a_k sin(k π t))).
+  Zero-initialized parameters give g_θ ≡ 1; γ=0.3 bounds the deviation to
+  ±30 % of the baseline at every t.  Boundary conditions and trapezoidal
+  envelope are inherited from the baseline shape — *cannot* be violated
+  by the network.
+- `MonotoneDeltaHead`: Δ(t) constructed as cumulative sum of softplus-positive
+  increments, then affine-mapped to [Δ_min, Δ_max].  Direction of the sweep
+  is fixed; the policy can only modulate *where* it spends time during the
+  sweep (slow through the avoided crossing, fast at the edges, etc).
+
+**Rationale:** Warm-start lets the network produce any shape, including
+physically destructive ones, before residuals are applied — exploration
+during early RL then easily drifts off the baseline and reward collapses.
+Arch 3 makes off-baseline drift architecturally impossible: any sampled
+schedule is still a valid adiabatic protocol, just with a slightly
+different timing or amplitude modulation.  The only deviations the
+network can express are exactly the ones that *should* matter physically.
+
+**Cost:** Less expressive than arch 1/2.  If the optimal schedule for
+some hard graph is genuinely non-adiabatic (Cain-style diabatic shortcuts),
+arch 3 cannot represent it.  This is a deliberate trade-off: we sacrifice
+the ceiling to lift the floor and stabilize learning.  Arch 1/2 remain
+available for exploratory work.
+
+### 2.10 Algorithm pipeline (v8)
+
+**Decision:** PPO with paired-baseline advantages, multiple rollouts per
+graph, advantage normalization, optional replay buffer, BC pretraining,
+and residual-α curriculum.
+
+Why each piece, briefly:
+
+- **Paired baselines** (`A(G) = r_learned(G) − r_baseline(G)`) remove the
+  dominant variance term in policy gradients on heterogeneous graph pools.
+  Standard REINFORCE's EMA baseline cannot track per-graph reward levels
+  fast enough when the pool is refreshed periodically.
+- **K rollouts per graph** averages out measurement noise in the
+  simulator (50 shots → 14 % binomial s.e. on any binary event).
+- **Advantage normalization** stabilizes the effective learning rate
+  across batches.
+- **PPO clipping (ε=0.2)** + 4 inner epochs lets us reuse each simulator
+  call several times without destructive updates.
+- **Replay buffer** extends that reuse further; PPO clipping bounds the
+  effective off-policy distance.
+- **BC pretraining** is what makes the first PPO update meaningful: by
+  the time RL starts, policy mean ≈ baseline and critic ≈ true baseline
+  reward, so the advantage already reflects "did this perturbation help
+  for *this* graph?".
+- **Residual-α curriculum** starts the policy in a tiny neighborhood of
+  the baseline and slowly expands the trust region.  Equivalent to a
+  scheduled KL constraint against the baseline.
+
+This is the minimal pipeline that gives both **convergence** (low variance,
+stable updates) and **outperformance** (baseline is the *floor*, not a
+random init).
+
+### 2.11 Graph-conditioning diagnostics (v8)
+
+To support the central scientific claim — "the learned policy has
+internalized graph-dependent physics" — we measure two quantities every
+`diagnostics_every` steps on the eval pool:
+
+1. **Schedule-deviation correlations.** Pearson r between per-graph
+   L2 schedule deviation from baseline and graph features (n, density,
+   λ₂, clustering, mean degree).  Non-zero correlations tell us the
+   policy is at least *responding* to graph identity.
+2. **Conditioning index.** Variance of mean schedules across graphs
+   divided by variance across rollouts on a single graph.  High =
+   graph identity matters more than noise; low = the policy collapsed
+   to a single mode regardless of input.
+
+The probes are *not* used to drive training — they are evidence in the
+eventual write-up.  They tell us whether to claim graph-conditioning or
+not, before we try to claim it.
+
 ---
 
 ## 4. Implementation milestones
@@ -258,3 +386,88 @@ Selected via `config.controls.architecture = 2`. Shares the same GIN encoder, fe
     - `train.py` CLI: `--backend mock` for testing without Braket, `--backend simulator` for real p_MIS. Supports `--steps`, `--shots`, `--batch-size`, `--lr`, etc.
   - 9 new tests in `test_module3_training.py`: pool construction, baseline validation, learner instantiation, single train step, evaluation, checkpoint round-trip, standalone reinforce_step, ScheduleModel isinstance check.
   - 38 total tests across the project (3 config + 26 Module 1 + 9 Module 3), all passing.
+- **v6 (configurable reward function):**
+  - New `RewardConfig` dataclass in `config.py` with fields: `kind` (`"is_cost"` | `"p_mis"` | `"composite"`), `penalty_U`, `mis_bonus`, `normalize_by_nodes`.
+  - Default reward changed from sparse `p_mis` to dense `is_cost`: r = (Σ s_i − U·Σ s_i·s_j) / |V|, averaged over shots. Does not require knowing |MIS|.
+  - `backend_adapter.py` rewritten with `_is_cost_from_counts()` and `_compute_reward()`. `make_reward_fn()` now accepts `RewardConfig`.
+  - `config.json` extended with `"reward"` section.
+  - `train.py` supports `--reward` and `--penalty-U` CLI overrides.
+  - 9 new reward function tests (total 47 across the project).
+- **v7 (warm-start / residual parameterization):**
+  - New `warm_start: bool = True` in `ControlsConfig`.
+  - `SchedulePolicy` computes baseline (trapezoidal Ω + linear Δ) and neutral head profiles as buffers.
+  - Head outputs reinterpreted as `baseline + (head − neutral)`, clamped to physical bounds.
+  - At random init, output ≈ baseline; training learns graph-specific corrections.
+  - When `learn_omega=False`, warm-start only applies to Delta (Omega is already baseline).
+  - 8 new warm-start tests (omega near baseline, delta closer to baseline, gradient flow, learn_omega=False invariance, physical bounds).  55 total tests.
+- **v8 (PPO + physics-prior heads + BC pretraining + diagnostics):**
+  Overhauls the learning pipeline to address convergence and outperformance
+  failures observed in early training runs. Seven coordinated changes:
+  - **Architecture 3 (physics-prior heads).** New `MultiplicativeOmegaHead`
+    parameterizes Ω(t) = baseline(t) · g_θ(t) with g_θ ∈ [1−γ, 1+γ] (γ=0.3
+    default); cannot blow up Ω, preserves Ω(0)=Ω(T)=0 and the trapezoidal
+    envelope by construction.  New `MonotoneDeltaHead` parameterizes Δ(t)
+    as the cumulative sum of softplus-positive increments, mapped affinely
+    to [Δ_min, Δ_max]; guarantees monotone non-decreasing sweep regardless
+    of network output.  Both heads have zero-initialized output layers so
+    that at init the policy reproduces the analytic baseline exactly.
+    `config.controls.architecture=3` selects them; warm_start is ignored
+    for arch 3 (residual structure baked into the heads themselves).
+  - **Residual-α curriculum.** New buffer `policy.residual_alpha`
+    (initially `residual_alpha_start=0.05`) scales the deviation from
+    baseline at every forward pass.  Linearly annealed by the
+    orchestrator from `residual_alpha_start` → `residual_alpha_end` over
+    `residual_alpha_warmup_steps`.  Acts as a trust region around the
+    baseline so early exploration cannot destroy the schedule.
+  - **PPO with paired baselines.** New `module3/ppo.py`.  For every graph
+    in the batch, K=4 schedule rollouts are sampled *and* the analytic
+    baseline is evaluated once on the same graph.  The advantage is
+    `A(G) = r_learned(G) − r_baseline(G)` instead of an EMA-tracked
+    `r − ema(r)`.  Eliminates per-graph reward heterogeneity that the EMA
+    cannot track quickly enough.  Advantages are normalized to
+    zero-mean unit-variance within each gradient step.  Standard PPO-clip
+    loss with 4 inner epochs over the collected rollouts.
+  - **Per-graph normalized reward (`is_cost_vs_baseline`).** New default
+    `RewardConfig.kind`.  Returns
+    `(r_learned − r_baseline) / (|r_baseline| + ε)` — fractional
+    improvement over the adiabatic baseline.  Backed by a
+    `BaselineRewardCache` that runs the simulator on the baseline schedule
+    exactly once per graph and caches the result.  Removes graph-scale
+    effects from the gradient signal.
+  - **Behavioral cloning pretraining.** New `module3/pretrain.py`.  Two
+    short supervised loops before any RL:
+    1. **Policy BC** — MSE between policy.forward(G) and the analytic
+       baseline schedule on every pool graph.  No simulator calls.
+    2. **Critic BC** — MSE between value_head(G) and the measured
+       baseline reward on every pool graph.  One simulator call per pool
+       graph (reused later as the paired-baseline cache).
+    So RL starts from policy mean ≈ baseline, critic ≈ true baseline
+    reward.  First PPO advantage already reflects "did this perturbation
+    help?" rather than "is the network even near the baseline?".
+  - **Replay buffer for off-policy reuse.** `module3/replay.py` FIFO
+    buffer of `(graph, sampled_params, old_logprob, reward, …)` tuples.
+    `TrainingConfig.replay_buffer_size > 0` enables it; PPO mixes
+    `replay_mix_ratio · batch_rollouts` replayed entries into each
+    update.  Importance-sampling correction is implicit in the PPO
+    clipping.  Amortizes the cost of each simulator call across several
+    gradient steps.
+  - **Pool curation + probe diagnostics.** `_curate_pool` filters the
+    training pool to graphs whose baseline reward falls in
+    `(curation_lo, curation_hi)` — discards trivially solvable / fully
+    unsolvable instances that carry no learning signal.
+    `module3/diagnostics.py` defines `schedule_deviation_probe` (per-graph
+    L2 deviation from baseline + Pearson correlations with graph features
+    n, density, λ₂, clustering) and `graph_conditioning_index` (ratio of
+    between-graph variance to within-graph variance of the schedules).
+    The orchestrator calls these every `diagnostics_every` steps and
+    logs the results.  This is the evidence we'll use to claim the
+    learned policy is *genuinely* graph-conditional.
+  - **Algorithm dispatch.** `TrainingConfig.algorithm ∈ {"reinforce",
+    "ppo"}`, default `"ppo"`.  `train.py` adds CLI flags `--algorithm`,
+    `--rollouts-per-graph`, `--no-paired-baseline`, `--no-bc-pretrain`.
+  - **Tests.** 27 new tests in `test_module3_improvements.py` covering
+    Arch 3 head shapes/constraints/baseline match, residual-α schedule,
+    `is_cost_vs_baseline` cache + correctness, PPO collect/loss/step,
+    paired-baseline advantage equality, BC policy + critic convergence,
+    replay buffer FIFO + capacity-0 behavior, diagnostics outputs.
+    89 total tests, all passing.
